@@ -51,8 +51,8 @@ extern "C" {
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
-#include <linux/fs.h>
 #include <sys/mount.h>
+#include <linux/fs.h>
 
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
