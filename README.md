@@ -41,12 +41,28 @@ You may define the environment variable **EFIVARFS_MOUNT_POINT** to an alternati
 The tool inspects the first four bytes of an ESL file to check if it originates from the efivarfs. In this case, the first four bytes contain (always Little Endian) the EFI variable attributes, which are delivered this way from the efivarfs implementation in the Linux kernel.
 
 ### TODOs
-
 Implement **EFI_VARIABLE_AUTHENTICATION_3** structure support.
 
 ### License
-
 MIT
+
+## More details
+The dumped (extracted) files are stored with different file extensions according to their content:
+* **.cer** if it is an X.509 certificate (DER-encoded according to ITU-T X.690 DER)
+* **.hsh** if it is a message digest (raw), e.g. 32 bytes for a SHA-256
+* **.raw** if it is an unknown signature format (unknown/unsupported GUID)
+A .cer file can be dumped with the OpenSSL command line tool via:
+```
+openssl x509 -inform DER -in <file> -noout -text
+```
+It can be converted to the PEM (BASE64) format via:
+```
+openssl x509 -inform DER -outform PEM -in <file> -out <target file>
+```
+The filename syntax of an extracted EFI signature is:
+
+&lt;*four digits counter*&gt;-efisig_&lt;*textual infix according to signature type*&gt;_&lt;*owner GUID*&gt;.{crt|hsh}
+
 
 
 
