@@ -28,8 +28,8 @@
 
 #include <uefi.h>
 
-#define PROG_VERSION          "1.0"
-#define PROG_DATE             "2024/08/15"
+#define PROG_VERSION          "1.1"
+#define PROG_DATE             "2024/09/11"
 
 #ifdef _BIG_ENDIAN_HOST
 #define efi_bswap_16(_x)      bswap_16(_x)
@@ -96,6 +96,7 @@ int main ( int argc, char *argv[] )
   x509_info               x509info;
   uint32_t                filecnt = 0;
   x509_info               signer_infos;
+  char                    buffer[256];
 
   if (3 != argc && 4 != argc)
   {
@@ -108,12 +109,18 @@ ShowHelp:
     fprintf(stdout,"       from an EFI variable in an EFIVARFS file system).\n\n");
     fprintf(stdout,"       You MAY alternatively specify an .auth file.\n");
     fprintf(stdout,"       The PKCS#7 signer is extracted and displayed in this case.\n\n");
+    fprintf(stdout,"       If you omit the trailing GUID of an EFI variable file below\n");
+    fprintf(stdout,"       a mounted efivarfs, then the tool tries to lookup and append\n");
+    fprintf(stdout,"       the correct GUID for you (you have to specify the variable name\n");
+    fprintf(stdout,"       with a trailing dash '-' in this case, e.g. 'dbDefault-'\n\n");
     fprintf(stdout,"       <folder> is the target folder where extracted files\n");
     fprintf(stdout,"       are stored. If the folder does not exist, then it\n");
     fprintf(stdout,"       will be created.\n");
     fprintf(stdout,"       Existing files will be overwritten without warning!\n\n");
     fprintf(stdout,"       Optionally specify --no-colors if you want to disable\n");
     fprintf(stdout,"       colored console output.\n\n");
+    fprintf(stdout,"       The environment variable EFIVARFS_MOUNT_POINT may be set\n");
+    fprintf(stdout,"       to a location other than /sys/firmware/efi/efivars\n\n");
     fprintf(stdout,"       [version "PROG_VERSION" dated "PROG_DATE" -\n");
     fprintf(stdout,"        Ingo A. Kubbilun - mailto:ingo.kubbilun@gmail.com]\n\n");
 
@@ -159,6 +166,17 @@ ShowHelp:
       return 1;
     }
   }
+
+  // NEW: if the caller has just specified the prefix of the EFI variable name
+  // ---- (without GUID), then try to lookup the variable name in the internal
+  //      lookup table adding the GUID to the filename.
+  //
+  //      The specified prefix has to end with a dash '-', e.g. "dbDefault-"
+
+  memset(buffer, 0, sizeof(buffer));
+  strncpy(buffer, esl_file, sizeof(buffer) - 1);
+  if (efivar_complete_filename(buffer, sizeof(buffer)))
+    esl_file = buffer;
 
   fd = open(esl_file, O_RDONLY);
   if (fd < 0)

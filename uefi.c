@@ -31,6 +31,59 @@
 
 static bool g_have_mounted_efivarfs = false;
 
+static const char g_wellknown_efi_variables[][64] =
+{
+  "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f",
+  "dbDefault-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+  "dbx-d719b2cb-3d3a-4596-a3bc-dad00e67656f",
+  "dbxDefault-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+  "KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+  "KEKDefault-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+  "PK-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+  "PKDefault-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+};
+
+#define likely(expr)    (__builtin_expect(!!(expr), 1))
+#define unlikely(expr)  (__builtin_expect(!!(expr), 0))
+
+bool efivar_complete_filename ( char *filename, uint32_t filename_max_size )
+{
+  uint32_t      i, l;
+  char         *p;
+
+  if (NULL == filename || 0 == filename_max_size)
+    return false;
+
+  l = (uint32_t)strlen(filename);
+
+  if (0 == l || l >= filename_max_size) // remember: always zero-terminated, use greater than or equal here
+    return false;
+
+  if ('-' != filename[l-1])
+    return true; // this is not a prefix, do not do anything
+
+  p = strrchr(filename,'/'); // look for the final path separator
+
+  if (NULL == p)
+    return true; // again, nothing we can do for ya
+
+  p++;
+  l = (uint32_t)strlen(p); // this is the length of the prefix
+  if (l >= 64)
+    return true; // prefix too long for our lookup table
+
+  for (i = 0; i < (sizeof(g_wellknown_efi_variables) / sizeof(g_wellknown_efi_variables[0])); i++)
+  {
+    if (!memcmp(p, g_wellknown_efi_variables[i], l)) // prefix found, we add the GUID as the suffix now
+    {
+      snprintf(p, filename_max_size - ((uint32_t)(p - filename)), "%s", g_wellknown_efi_variables[i]);
+      return true; // OK and modified
+    }
+  }
+
+  return true; // OK but did not modify the filename
+}
+
 bool efivarfs_mount ( const char *efivarfs_mountpoint )
 {
   char            testfile[256];
@@ -63,6 +116,238 @@ void efivarfs_umount ( const char *efivarfs_mountpoint )
   }
 }
 
+#define ASN1_INDEFINITE_LENGTH ((uint64_t)-1)
+
+static bool asn1_decodelen(const uint8_t* der, uint64_t len, uint64_t* derlen, uint64_t* idx)
+{
+  uint64_t          maxidx;
+  uint32_t          i;
+  uint8_t           value;
+
+  if (unlikely(*idx >= len))
+    return false;//PrintMessage(ASN1_ERROR_INSUFFICIENT_INPUT_DATA); // not enough data available
+
+  value = (uint8_t)der[*idx];
+  (*idx)++;
+  if (value < 128)
+    *derlen = (uint64_t)value;
+  else
+  if (128 == value) // 128 = 0x80 = infinite length (BER)
+  {
+    *derlen = ASN1_INDEFINITE_LENGTH;
+    return true;
+  }
+  else
+  {
+    *derlen = 0;
+    value -= 128;
+    if (value > 8)
+      return false;//PrintMessage(ASN1_ERROR_LENGTH_EXCEEDS_64BIT); // too big
+
+    if (unlikely((*idx + value) > len))
+      return false;//PrintMessage(ASN1_ERROR_INSUFFICIENT_INPUT_DATA); // not enough data available
+
+    for (i = 0; i < value; i++)
+    {
+      *derlen <<= 8;
+      *derlen |= der[*idx];
+      (*idx)++;
+    }
+
+    if (unlikely(8==value && ASN1_INDEFINITE_LENGTH == *derlen)) // (uint64_t)-1 is reserved for infinite length, sorry...
+      return false;//PrintMessage(ASN1_ERROR_LENGTH_EXCEEDS_64BIT); // too big
+  }
+
+  maxidx = (*idx) + (*derlen);
+
+  return (maxidx > len || maxidx < *idx) ? false/*PrintMessage(ASN1_ERROR_INSUFFICIENT_INPUT_DATA)*/ : true;
+}
+
+static const uint8_t id_signeddata_oid[] = { 0x06,0x09,0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x07,0x02 };
+
+static bool asn1_encodelen(uint8_t* der, uint64_t derlen, uint64_t len, uint64_t* idx)
+{
+  if (unlikely(NULL == der || NULL == idx))
+    return false;
+
+  if (ASN1_INDEFINITE_LENGTH == derlen)
+  {
+    if (unlikely(*idx >= len))
+      return false;
+    der[*idx] = (uint8_t)0x80;
+    (*idx)++;
+  }
+  else
+  {
+    if (derlen <= 127)
+    {
+      if (unlikely( (*idx + 1 + derlen) > len))
+        return false;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x00000000000000FFL)
+    {
+      if (unlikely((*idx + 2 + derlen) > len))
+        return false;
+      der[*idx] = 0x81;
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x000000000000FFFFL)
+    {
+      if (unlikely((*idx + 3 + derlen) > len))
+        return false;
+      der[*idx] = 0x82;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x0000000000FFFFFFL)
+    {
+      if (unlikely((*idx + 4 + derlen) > len))
+        return false;
+      der[*idx] = 0x83;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 16);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x00000000FFFFFFFFL)
+    {
+      if (unlikely((*idx + 5 + derlen) > len))
+        return false;
+      der[*idx] = 0x84;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 24);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 16);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x000000FFFFFFFFFFL)
+    {
+      if (unlikely((*idx + 6 + derlen) > len))
+        return false;
+      der[*idx] = 0x85;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 32);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 24);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 16);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x0000FFFFFFFFFFFFL)
+    {
+      if (unlikely((*idx + 7 + derlen) > len))
+        return false;
+      der[*idx] = 0x86;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 40);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 32);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 24);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 16);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    if (derlen <= 0x00FFFFFFFFFFFFFFL)
+    {
+      if (unlikely((*idx + 8 + derlen) > len))
+        return false;
+      der[*idx] = 0x87;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 48);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 40);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 32);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 24);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 16);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+    else
+    {
+      if (unlikely((*idx + 9 + derlen) > len))
+        return false;
+      der[*idx] = 0x88;
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 56);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 48);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 40);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 32);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 24);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 16);
+      (*idx)++;
+      der[*idx] = (uint8_t)(derlen >> 8);
+      (*idx)++;
+      der[*idx] = (uint8_t)derlen;
+      (*idx)++;
+    }
+  }
+  return true;
+}
+
+static uint32_t asn1_getlengthencodinglength(uint64_t derlen)
+{
+  if (ASN1_INDEFINITE_LENGTH == derlen)
+    return 1;
+  if (derlen <= 127)
+    return 1;
+  if (derlen <= 0x00000000000000FFL)
+    return 2;
+  if (derlen <= 0x000000000000FFFFL)
+    return 3;
+  if (derlen <= 0x0000000000FFFFFFL)
+    return 4;
+  if (derlen <= 0x00000000FFFFFFFFL)
+    return 5;
+  if (derlen <= 0x000000FFFFFFFFFFL)
+    return 6;
+  if (derlen <= 0x0000FFFFFFFFFFFFL)
+    return 7;
+  if (derlen <= 0x00FFFFFFFFFFFFFFL)
+    return 8;
+  return 9; // assuming that nothing exceeds 64bit...
+}
+
 uint32_t esl_file_get_offset ( const uint8_t *esl_data, uint32_t esl_size, x509_info_ptr signer_info )
 {
   const uint8_t        *try_data;
@@ -74,6 +359,10 @@ uint32_t esl_file_get_offset ( const uint8_t *esl_data, uint32_t esl_size, x509_
   BIO                  *membio;
   STACK_OF(X509)       *signers;
   X509                 *signer_cert;
+  uint32_t              idx = 0;
+  static const uint8_t  pkcs7_guid[16] = { 0x9D,0xD2,0xAF,0x4A,0xDF,0x68,0xEE,0x49,0x8A,0xA9,0x34,0x7D,0x37,0x56,0x65,0xA7 };
+  uint8_t              *pkcs7_der_ptr2 = NULL;
+  uint32_t              pkcs7_size2 = 0;
 
   if (NULL == esl_data || esl_size < 4)
     return 0;
@@ -84,7 +373,14 @@ uint32_t esl_file_get_offset ( const uint8_t *esl_data, uint32_t esl_size, x509_
   // #1: Check if the file starts with the EFI variable attributes (Little Endian, 32bit, one byte, followed by three zero bytes - currently)
 
   if  (0x00 == esl_data[1] && 0x00 == esl_data[2] && 0x00 == esl_data[3])
-    return 4; // this is an ESL file, the first four bytes filled with EFI variable attributes (most likely read from /sys/firmware/efi/efivars dir)
+  {
+    // we have found the attributes, which are required by the EFIVARFS; check now if we have the AUTH GUID
+
+    if ((esl_size > (28+16)) && (!memcmp(esl_data + 4 + 24, pkcs7_guid, 16)))
+      idx = 4;
+    else
+      return 4; // this is an ESL file, the first four bytes filled with EFI variable attributes (most likely read from /sys/firmware/efi/efivars dir)
+  }
 
   // #2: Check if this is an AUTHENTICATION_2 structure (the file is an .auth file)
   //
@@ -133,8 +429,8 @@ uint32_t esl_file_get_offset ( const uint8_t *esl_data, uint32_t esl_size, x509_
 
 #endif
 
-  try_data = esl_data;
-  try_size = esl_size;
+  try_data = esl_data + idx;
+  try_size = esl_size - idx;
 
   if (try_size < sizeof(EFI_TIME))
     goto CheckAuth3;
@@ -169,42 +465,89 @@ uint32_t esl_file_get_offset ( const uint8_t *esl_data, uint32_t esl_size, x509_
 
   if (NULL != signer_info)
   {
-    membio = BIO_new_mem_buf((void*)pkcs7_der_ptr, pkcs7_size);
+    // first check if this is an incomplete PKCS#7 signedData (which is allowed by UEFI specification!)
+
+    if (0x30 == pkcs7_der_ptr[0])
+    {
+      uint64_t idx = 1, derlen;
+
+      if (asn1_decodelen(pkcs7_der_ptr, pkcs7_size, &derlen, &idx))
+      {
+        if ((derlen >= sizeof(id_signeddata_oid)) && (memcmp(pkcs7_der_ptr + idx, id_signeddata_oid, sizeof(id_signeddata_oid)))) // oops, missing!
+        {
+          uint32_t innersize = 1 + asn1_getlengthencodinglength(pkcs7_size) + pkcs7_size + sizeof(id_signeddata_oid);
+          pkcs7_size2 = 1 + asn1_getlengthencodinglength(innersize) + innersize;
+          pkcs7_der_ptr2 = (uint8_t*)malloc(pkcs7_size2);
+          if (unlikely(NULL == pkcs7_der_ptr2))
+            return 0;
+          idx = 0;
+          pkcs7_der_ptr2[idx++] = 0x30;
+          if (unlikely(!asn1_encodelen(pkcs7_der_ptr2, innersize, pkcs7_size2, &idx)))
+          {
+            free(pkcs7_der_ptr2);
+            return 0;
+          }
+          memcpy(pkcs7_der_ptr2 + idx, id_signeddata_oid, sizeof(id_signeddata_oid));
+          idx += sizeof(id_signeddata_oid);
+          pkcs7_der_ptr2[idx++] = 0xA0;
+          if (unlikely(!asn1_encodelen(pkcs7_der_ptr2, pkcs7_size, pkcs7_size2, &idx)))
+          {
+            free(pkcs7_der_ptr2);
+            return 0;
+          }
+          memcpy(pkcs7_der_ptr2 + idx, pkcs7_der_ptr, pkcs7_size);
+        }
+      }
+    }
+
+    if (NULL != pkcs7_der_ptr2 && 0 != pkcs7_size2)
+      membio = BIO_new_mem_buf((void*)pkcs7_der_ptr2, pkcs7_size2);
+    else
+      membio = BIO_new_mem_buf((void*)pkcs7_der_ptr, pkcs7_size);
+
     if (NULL == membio)
+    {
+      if (NULL != pkcs7_der_ptr2)
+        free(pkcs7_der_ptr2), pkcs7_der_ptr2 = NULL;
       goto CheckAuth3;
+    }
 
     pkcs7 = d2i_PKCS7_bio(membio, NULL);
 
-    if (NULL == pkcs7)
+    if (NULL != pkcs7) // DER-decoded the PKCS#7 successfully
     {
       BIO_free(membio);
-      goto CheckAuth3;
-    }
 
-    BIO_free(membio);
+      signers = PKCS7_get0_signers(pkcs7,NULL,0);
 
-    signers = PKCS7_get0_signers(pkcs7,NULL,0);
-
-    if (NULL != signers)
-    {
-      if (1 == sk_X509_num(signers)) // we support one single signer only
+      if (NULL != signers)
       {
-        signer_cert = sk_X509_value(signers, 0); // get the X.509 certificate
-        if (NULL != signer_cert)
+        if (1 == sk_X509_num(signers)) // we support one single signer only
         {
-          if (!x509_get_information((const uint8_t*)signer_cert, 0, signer_info))
-            memset(signer_info, 0, sizeof(x509_info));
+          signer_cert = sk_X509_value(signers, 0); // get the X.509 certificate
+          if (NULL != signer_cert)
+          {
+            if (!x509_get_information((const uint8_t*)signer_cert, 0, signer_info))
+              memset(signer_info, 0, sizeof(x509_info));
+          }
         }
+        sk_X509_free(signers);
       }
-      sk_X509_free(signers);
-    }
 
-    PKCS7_free(pkcs7);
+      PKCS7_free(pkcs7);
+    }
+    else // unable to DER-decode the PKCS#7 (only occurs if a signature scheme is unknown)
+    {
+      BIO_free(membio);
+    }
   }
+
+  if (NULL != pkcs7_der_ptr2)
+    free(pkcs7_der_ptr2);
 
   // the ESL itself (EFI_SIGNATURE_LIST) is the trailing item in a .auth file, so just return its offset:
 
-  return sizeof(EFI_TIME) + sizeof(WIN_CERTIFICATE) + sizeof(GUID) + pkcs7_size;
+  return sizeof(EFI_TIME) + sizeof(WIN_CERTIFICATE) + sizeof(GUID) + pkcs7_size + idx;
 
   // #3: Check if this is an AUTHENTICATION_3 structure (the file is also an .auth file)
 
@@ -213,6 +556,7 @@ CheckAuth3:
   // TODO: NOT YET IMPLEMENTED
 
   // #4: Otherwise assume that this is just a 'bare' ESL file starting with a GUID
+
 
   return 0; // offset is zero in this case
 }

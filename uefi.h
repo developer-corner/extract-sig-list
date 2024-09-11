@@ -51,8 +51,8 @@ extern "C" {
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
-#include <sys/mount.h>
 #include <linux/fs.h>
+#include <sys/mount.h>
 
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -296,21 +296,13 @@ typedef struct __attribute__((packed)) _EFI_CRYPTO_INDICATION
 
 typedef struct __attribute__((packed))
 {
-  uint32_t  dwLength;
-  uint16_t  wRevision;
-  uint16_t  wCertificateType;
-  uint8_t   bCertificate[0];
+  uint32_t  dwLength;           ///< sizeof: 4
+  uint16_t  wRevision;          ///< sizeof: 2
+  uint16_t  wCertificateType;   ///< sizeof: 2
+  uint8_t   bCertificate[0];    ///< sizeof: variable
 } WIN_CERTIFICATE;
 
 #pragma GCC diagnostic pop
-
-#define SHA256_DIGEST_SIZE        32
-#define SHA384_DIGEST_SIZE        48
-#define SHA512_DIGEST_SIZE        64
-
-typedef uint8_t   EFI_SHA256_HASH[SHA256_DIGEST_SIZE];
-typedef uint8_t   EFI_SHA384_HASH[SHA384_DIGEST_SIZE];
-typedef uint8_t   EFI_SHA512_HASH[SHA512_DIGEST_SIZE];
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -367,9 +359,9 @@ typedef struct __attribute__((packed))
 
 typedef struct __attribute__((packed))
 {
-  WIN_CERTIFICATE   Hdr;
-  EFI_GUID          CertType;
-  uint8_t           CertData[0];
+  WIN_CERTIFICATE   Hdr;          ///< sizeof: 8+x
+  EFI_GUID          CertType;     ///< sizeof: 16
+  uint8_t           CertData[0];  ///< sizeof: variable
 } WIN_CERTIFICATE_UEFI_GUID;
 
 typedef struct __attribute__((packed))
@@ -441,6 +433,7 @@ typedef struct __attribute__((packed))
 #define _UEFI_VARIABLE_SECUREBOOT                           "SecureBoot"
 #define _UEFI_VARIABLE_SETUPMODE                            "SetupMode"
 #define _UEFI_VARIABLE_SIGNATURSUPPORT                      "SignatureSupport"
+#define _UEFI_VARIABLE_VENDORKEYS                           "VendorKeys"
 
 #define UEFI_VARIABLE_AUDITMODE                             _UEFI_VARIABLE_AUDITMODE "-" GUID_EFI_GLOBAL_VARIABLE
 #define UEFI_VARIABLE_BOOT_NNNN                             _UEFI_VARIABLE_BOOT_NNNN "-" GUID_EFI_GLOBAL_VARIABLE
@@ -462,6 +455,7 @@ typedef struct __attribute__((packed))
 #define UEFI_VARIABLE_SECUREBOOT                            _UEFI_VARIABLE_SECUREBOOT "-" GUID_EFI_GLOBAL_VARIABLE
 #define UEFI_VARIABLE_SETUPMODE                             _UEFI_VARIABLE_SETUPMODE "-" GUID_EFI_GLOBAL_VARIABLE
 #define UEFI_VARIABLE_SIGNATURSUPPORT                       _UEFI_VARIABLE_SIGNATURSUPPORT "-" GUID_EFI_GLOBAL_VARIABLE
+#define UEFI_VARIABLE_VENDORKEYS                            _UEFI_VARIABLE_VENDORKEYS "-" GUID_EFI_GLOBAL_VARIABLE
 
 #define X509_KEY_TYPE_UNKNOWN     0
 #define X509_KEY_TYPE_RSA         1
@@ -481,6 +475,32 @@ struct _x509_information
   uint32_t            key_type;       ///< X509_KEY_TYPE_xxx constants (see above)
   uint32_t            key_bit_size;   ///< 0 if unknown
 };
+
+/**
+ * @brief Appends the GUID of an EFI variable if found in internal lookup table.
+ *
+ *        Checks if the specified file name ends with a dash '-'. Goes back to the
+ *        previous path separator '/', goes to the character after this slash.
+ *        Scans for the EFI variable prefixes "db-", "dbDefault-", "dbx-",
+ *        "dbxDefault-", "KEK-", "KEKDefault-", "PK-", "PKDefault-" or "VendorKeys-".
+ *        If one of these is found, appends the GUID of the EFI variable to the
+ *        file name.
+ *
+ * @param [in/out]  filename          pointer to file name (IN); conditionally
+ *                                    modified (GUID appended) on OUT
+ * @param [in]      filename_max_size size of the buffer pointed to by file name;
+ *                                    shall provide more bytes than the input to
+ *                                    be able to append a GUID.
+ *                                    The result is always zero-terminated, i.e.
+ *                                    a maximum amount of filename_max_size-1
+ *                                    non-zero characters are written
+ *
+ * @return false on error (parameter validation error or string length validation
+ *         error), otherwise true (success). In the 'true' case, the input
+ *         file name gets modified if and only if the prefix of the EFI variable
+ *         name is found in the internal lookup table.
+ */
+bool efivar_complete_filename ( char *filename, uint32_t filename_max_size );
 
 /**
  * @brief mounts the efivarfs (if not already mounted)
